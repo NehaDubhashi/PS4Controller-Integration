@@ -1,3 +1,5 @@
+import time
+import os
 from pyPS4Controller.controller import Controller
 from roboclaw import Roboclaw
 
@@ -33,9 +35,14 @@ class RoverController(Controller):
         rc.BackwardM2(ADDR, 60)
 
     def on_x_press(self):
-        print("STOP")
+        print("Stopping")
         rc.ForwardM1(ADDR, 0)
         rc.ForwardM2(ADDR, 0)
+
+# Wait until controller appears
+print("Waiting for /dev/input/js0 (PS4 controller)...")
+while not os.path.exists("/dev/input/js0"):
+    time.sleep(1)
 
 controller = RoverController(interface="/dev/input/js0", connecting_using_ds4drv=False)
 controller.listen()
