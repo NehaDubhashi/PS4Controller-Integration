@@ -4,7 +4,7 @@ from pyPS4Controller.controller import Controller
 from roboclaw import Roboclaw
 
 # Connect to RoboClaw via UART
-rc = Roboclaw("/dev/ttyS0", 38400)
+rc = Roboclaw("/dev/serial0", 38400)
 rc.Open()
 ADDR = 128  # Default motor controller address
 
