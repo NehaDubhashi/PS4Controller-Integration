@@ -1,3 +1,5 @@
+import sys
+sys.path.append("/home/astrobotic/Documents/SDK/MotorControllers/roboclaw/Libraries/Python/roboclaw_python")
 import time
 import os
 from pyPS4Controller.controller import Controller
