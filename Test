@@ -1,0 +1,391 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+controllerskidsteer.py
+----------------------
+Drives a skid-steer rover with a PS4 controller (Joystick or Button mode)
+and listens on an RTL-SDR (or Serial port) to decode backscatter telemetry
+sent by a Raspberry Pi Pico + AHT10 sensor.
+
+The SDR receives an OOK (on-off-keyed) signal that contains:
+  Barker-7 preamble + 13-bit payload (temperature data).
+
+Decoded results are saved to a CSV file (and optionally .mat snapshots).
+"""
+
+# Standard Python library imports
+import os, sys, time, csv, math, argparse, threading, signal
+from datetime import datetime
+from pathlib import Path
+
+# ------------------------------------------------------------
+# 1.  Include RoboClaw + PS4 controller libraries
+# ------------------------------------------------------------
+# Added this path bc RoboClaw Python library isn’t globally installed.
+# sys.path.append() lets Python find modules in a custom directory.
+sys.path.append("/home/astrobotic/Documents/SDK/MotorControllers/roboclaw/Libraries/Python/roboclaw_python")
+
+from pyPS4Controller.controller import Controller  # handles PS4 joystick events
+from roboclaw_3 import Roboclaw                    # controls the RoboClaw motor drivers
+
+# ------------------------------------------------------------
+# 2.  Optional RX backends: Serial or RTL-SDR
+# ------------------------------------------------------------
+# Supports either reading raw bytes from a serial port (Pico)
+# or using an RTL-SDR dongle as a software radio.
+try:
+    import serial
+except Exception:
+    serial = None  # fallback if pyserial isn’t installed
+
+# RTL-SDR & DSP math modules
+try:
+    from rtlsdr import RtlSdr
+    import numpy as np
+    from scipy import signal as sp_signal
+    from scipy.io import savemat
+except Exception:
+    # If any of these fail to import, we’ll skip SDR decoding gracefully.
+    RtlSdr = None
+    np = None
+    sp_signal = None
+    savemat = None
+
+# ------------------------------------------------------------
+# 3.  Connect to RoboClaw motor drivers
+# ------------------------------------------------------------
+rc = Roboclaw("/dev/ttyS0", 38400)  # UART port + baud rate
+rc.Open()
+address1 = 0x80
+address2 = 0x81
+_shutdown = threading.Event()        # used to signal all threads to exit cleanly
+
+
+# ============================================================
+# PS4 CONTROLLER CLASSES (Joystick + Trigger modes)
+# ============================================================
+# Exit hooks? add
+
+class JoystickController(Controller):
+    """Maps joystick analog sticks to forward/backward movement."""
+    def __init__(self, maxSpeed, deadZone, **kwargs):
+        super().__init__(**kwargs)
+        self.maxSpeed = maxSpeed
+        self.deadZone = deadZone
+
+    def mapSpeed(self, value):
+        """Scales raw analog input [-32767..32767] into motor speed."""
+        if abs(value) < self.deadZone:
+            return 0
+        return int((abs(value) / 32767.0) * self.maxSpeed)
+
+    # Movement mappings
+    def on_L3_up(self, value):
+        speed = self.mapSpeed(value)
+        rc.SpeedM1(address1, -speed)
+        rc.SpeedM2(address2, -speed)
+
+    def on_L3_down(self, value):
+        speed = self.mapSpeed(value)
+        rc.SpeedM1(address1, speed)
+        rc.SpeedM2(address2, speed)
+
+    def on_R3_up(self, value):
+        speed = self.mapSpeed(value)
+        rc.SpeedM2(address1, speed)
+        rc.SpeedM1(address2, speed)
+
+    def on_R3_down(self, value):
+        speed = self.mapSpeed(value)
+        rc.SpeedM2(address1, -speed)
+        rc.SpeedM1(address2, -speed)
+
+    def on_x_press(self):
+        """Stops motors + signals all threads to shut down."""
+        print("X pressed - stopping all motors and shutting down.")
+        rc.SpeedM1(address1, 0); rc.SpeedM2(address1, 0)
+        rc.SpeedM1(address2, 0); rc.SpeedM2(address2, 0)
+        _shutdown.set()
+        os._exit(0)
+
+
+class TriggerController(Controller):
+    """Button-based tank control mode using triggers and arrows."""
+    def __init__(self, maxSpeed, **kwargs):
+        super().__init__(**kwargs)
+        self.speed = maxSpeed
+        self.left = 0
+        self.right = 0
+
+    # The updateMotors() function consolidates logic to prevent repetition.
+    def updateMotors(self):
+        if self.left == 1:   # forward
+            rc.SpeedM1(address1, self.speed)
+            rc.SpeedM2(address2, self.speed)
+        elif self.left == 2: # backward
+            rc.SpeedM1(address1, -self.speed)
+            rc.SpeedM2(address2, -self.speed)
+        else:
+            rc.SpeedM1(address1, 0); rc.SpeedM2(address2, 0)
+
+        if self.right == 1:  # turn right
+            rc.SpeedM2(address1, -self.speed)
+            rc.SpeedM1(address2, -self.speed)
+        elif self.right == 2: # turn left
+            rc.SpeedM2(address1, self.speed)
+            rc.SpeedM1(address2, self.speed)
+        else:
+            rc.SpeedM1(address1, 0); rc.SpeedM2(address2, 0)
+
+    # The rest are PS4 button event handlers calling updateMotors()
+    def on_up_arrow_press(self): self.left = 1; self.updateMotors()
+    def on_up_down_arrow_release(self): self.left = 0; self.updateMotors()
+    def on_L1_press(self): self.left = 2; self.updateMotors()
+    def on_L1_release(self): self.left = 0; self.updateMotors()
+    def on_triangle_press(self): self.right = 1; self.updateMotors()
+    def on_triangle_release(self): self.right = 0; self.updateMotors()
+    def on_R1_press(self): self.right = 2; self.updateMotors()
+    def on_R1_release(self): self.right = 0; self.updateMotors()
+
+    def on_x_press(self):
+        print("X pressed - stopping all motors and shutting down.")
+        rc.SpeedM1(address1, 0); rc.SpeedM2(address1, 0)
+        rc.SpeedM1(address2, 0); rc.SpeedM2(address2, 0)
+        _shutdown.set()
+        os._exit(0)
+
+
+# ============================================================
+# BASIC CSV LOGGING UTILITIES
+# ============================================================
+# Simple helpers that ensure the log file exists and append new rows.
+
+def ensure_paths(csv_path: Path, raw_path: Path):
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    if not csv_path.exists():
+        with csv_path.open("w", newline="") as f:
+            csv.writer(f).writerow(["iso_time_utc", "temp_c", "temp_f", "source", "notes"])
+
+def write_csv(csv_path: Path, temp_c, temp_f, source="rtlsdr", notes="ok"):
+    """Appends one measurement with UTC timestamp."""
+    ts = datetime.utcnow().isoformat()
+    with csv_path.open("a", newline="") as f:
+        csv.writer(f).writerow([ts, temp_c, temp_f, source, notes])
+
+
+# ============================================================
+# SERIAL BACKEND (optional alternate RX)
+# ============================================================
+# This is simpler but rarely used in your case since you use RTL-SDR.
+def serial_decode_frame(payload: bytes):
+    """Example: interpret first 2 bytes as temperature in 0.1°C units."""
+    if len(payload) < 2:
+        raise ValueError("short frame")
+    deciC = int.from_bytes(payload[:2], "big", signed=False)
+    temp_c = deciC / 10.0
+    temp_f = temp_c * 9/5 + 32.0
+    return temp_c, temp_f
+
+
+def serial_rx_thread(port, baud, csv_path, raw_path,
+                     preamble_hex="BA7B", frame_len=6):
+    """Reads bytes continuously, finds preambles, decodes frames."""
+    if serial is None:
+        print("[SERIAL] pyserial not installed; skipping.")
+        return
+    ensure_paths(csv_path, raw_path)
+    preamble = bytes.fromhex(preamble_hex)
+    buf = bytearray()
+
+    try:
+        ser = serial.Serial(port, baud, timeout=0.1)
+    except Exception as e:
+        print(f"[SERIAL] Open failed: {e}")
+        return
+
+    print(f"[SERIAL] Listening on {port}@{baud}")
+    with ser, raw_path.open("ab") as rawf:
+        while not _shutdown.is_set():
+            chunk = ser.read(512)
+            if chunk:
+                buf.extend(chunk)
+                rawf.write(chunk)
+                rawf.flush()
+
+            # Search for preamble inside buffer
+            while True:
+                i = buf.find(preamble)
+                if i < 0:
+                    break
+                if len(buf) < i + len(preamble) + frame_len:
+                    break
+                frame = buf[i + len(preamble): i + len(preamble) + frame_len]
+                del buf[:i + len(preamble) + frame_len]
+
+                try:
+                    temp_c, temp_f = serial_decode_frame(frame)
+                    write_csv(csv_path, temp_c, temp_f, "serial")
+                    print(f"[SERIAL] temp={temp_c:.2f}C")
+                except ValueError as e:
+                    write_csv(csv_path, "", "", "serial", f"bad_frame:{e}")
+            time.sleep(0.01)
+
+
+# ============================================================
+# RTL-SDR BACKEND
+# ============================================================
+# This section implements all the DSP logic that replaces your Jupyter notebook.
+
+# Barker-7 preamble pattern (same as TX)
+BARKER7 = np.array([1,1,1,0,0,1,0], dtype=np.int8) if np is not None else None
+
+# ---- Helper math utilities ----
+def bits_to_int(bits):
+    """Converts array of bits [1,0,1,...] to integer."""
+    v = 0
+    for b in bits:
+        v = (v << 1) | int(b)
+    return v
+
+# Temperature conversion helpers
+def aht10_celsius_from_t20(t20):
+    return (t20 / 1048576.0) * 200.0 - 50.0
+
+def t20_from_v13(v13):
+    """Reconstruct a 20-bit AHT10 temp field from 13-bit payload."""
+    return (1 << 18) | ((v13 & 0x1FFF) << 5)
+
+def v13_to_temp(v13):
+    t20 = t20_from_v13(v13)
+    temp_c = aht10_celsius_from_t20(t20)
+    temp_f = temp_c * 9/5 + 32
+    return temp_c, temp_f
+
+
+# ---- Signal processing building blocks ----
+def accumulate_iq_abs_with_refs(sq, sq90, samples, num_it, samp):
+    """
+    Implements your 'accumulate' notebook function.
+    Computes amplitude correlation against square-wave references.
+    """
+    a_val = np.empty(num_it)
+    for i in range(0, num_it*samp, samp):
+        sl = samples[i:i+samp]
+        if len(sl) < samp: break
+        a_i = np.sum(sq[i:i+samp]*np.abs(sl))
+        a_q = np.sum(sq90[i:i+samp]*np.abs(sl))
+        a_val[i//samp] = math.sqrt(a_i*a_i + a_q*a_q)
+    return a_val
+
+def threshold_to_bits(a_val, threshold):
+    """Turns amplitude values into digital 1/0 using a threshold."""
+    return (a_val >= threshold).astype(np.int8)
+
+def bits_from_oversampled(bit_stream, samps_per_bit):
+    """Downsample from oversampled to 1-bit-per-symbol by averaging."""
+    n_bits = len(bit_stream)//samps_per_bit
+    if n_bits <= 0: return np.array([],dtype=np.int8)
+    resh = bit_stream[:n_bits*samps_per_bit].reshape(n_bits, samps_per_bit)
+    return (resh.mean(axis=1) >= 0.5).astype(np.int8)
+
+# ---- Multi-hit Barker detection ----
+def find_all_barker_starts(bit_stream, samps_per_bit, corr_threshold=0.8, min_separation_bits=13):
+    """
+    Searches an oversampled bitstream for ALL Barker-7 preambles.
+    After each detection, skip ahead by (7 + payload) bits to avoid duplicates.
+    """
+    barker_os = np.repeat(BARKER7, samps_per_bit)
+    Lb = len(barker_os)
+    if len(bit_stream) < Lb: return []
+    corr = np.correlate(bit_stream.astype(np.float32), barker_os.astype(np.float32), mode="valid")/Lb
+
+    starts, i, skip = [], 0, (7 + min_separation_bits)*samps_per_bit
+    while i < len(corr):
+        j = np.argmax(corr[i:]) + i
+        if corr[j] < corr_threshold: break
+        starts.append(j + Lb)
+        i = j + skip
+    return starts
+
+# ---- Ping gating (detect when RF is on) ----
+def rolling_mean(x, win):
+    """Simple moving average filter for energy smoothing."""
+    if win<=1: return x
+    c = np.ones(win)/win
+    return np.convolve(x,c,mode="same")
+
+def detect_ping_windows(mags, fs, mean_k_sigma=3.0, smooth_ms=3.0, min_on_ms=1.0):
+    """Detect RF ON intervals from energy magnitude."""
+    win = max(1,int(round((smooth_ms/1000.0)*fs)))
+    sm = rolling_mean(mags,win)
+    mu,sigma = np.mean(sm),np.std(sm)
+    thr = mu + mean_k_sigma*sigma
+    mask = (sm>=thr).astype(np.uint8)
+    on_idxs=[]
+    in_run=False
+    for i,v in enumerate(mask):
+        if v and not in_run: in_run=True; start=i
+        elif not v and in_run: in_run=False; on_idxs.append((start,i))
+    if in_run: on_idxs.append((start,len(mask)))
+    min_len=int(round((min_on_ms/1000.0)*fs))
+    return [(s,e) for (s,e) in on_idxs if (e-s)>=min_len]
+
+
+# ---- Main RTL-SDR thread ----
+def rtlsdr_rx_thread(csv_path, raw_path,
+                     fs=1e6, fc=1.42e9, gain_db=2.0,
+                     fb=100, cycles_per_bit=100,
+                     chunk_seconds=0.5, corr_threshold=0.8,
+                     save_mat=False, mat_dir=None,
+                     ping_mode="off", ping_period_ms=None, ping_on_ms=None,
+                     guard_before_ms=2.0, guard_after_ms=2.0,
+                     ping_k_sigma=3.0, smooth_ms=3.0, min_on_ms=1.0):
+    """
+    Continuously reads SDR samples, demodulates OOK, finds Barker preambles,
+    decodes 13-bit payloads, and logs temperatures.
+    """
+    if RtlSdr is None or np is None:
+        print("[RTLSDR] dependencies missing.")
+        return
+    ensure_paths(csv_path, raw_path)
+    sdr = RtlSdr(); sdr.sample_rate=fs; sdr.center_freq=fc; sdr.gain=gain_db
+    print(f"[RTLSDR] Started @ {fs/1e6:.1f} Msps, fc={fc/1e6:.3f} GHz, gain={gain_db} dB")
+
+    # Derived timing parameters
+    Tbit=cycles_per_bit/fb
+    samp_per_bit=int(fs*Tbit)
+    samp_per_cycle=int(fs/fb)
+    N_chunk=int(fs*chunk_seconds)
+    if N_chunk<20*samp_per_cycle: N_chunk=20*samp_per_cycle
+
+    def make_refs(N):
+        t=np.arange(N)/fs
+        return (sp_signal.square(2*np.pi*fb*t), sp_signal.square(2*np.pi*fb*t+np.pi/2))
+
+    g_before=int((guard_before_ms/1000.0)*fs)
+    g_after=int((guard_after_ms/1000.0)*fs)
+    s_d_os_tail=np.array([],dtype=np.int8)
+
+    while not _shutdown.is_set():
+        iq=sdr.read_samples(N_chunk).astype(np.complex64)
+        mags=np.abs(iq)
+        windows=detect_ping_windows(mags,fs,ping_k_sigma,smooth_ms,min_on_ms) if ping_mode=="gated" else [(0,len(mags))]
+
+        for (s,e) in windows:
+            seg=mags[s+g_before:e-g_after]
+            if len(seg)<5*samp_per_cycle: continue
+            sq,sq90=make_refs(len(seg))
+            num_it=len(seg)//samp_per_cycle
+            a_val=accumulate_iq_abs_with_refs(sq,sq90,seg,num_it,samp_per_cycle)
+            s_d_os=threshold_to_bits(a_val,np.mean(a_val))
+            if ping_mode=="off" and s_d_os_tail.size:
+                s_d_os=np.concatenate([s_d_os_tail,s_d_os])
+            starts=find_all_barker_starts(s_d_os,cycles_per_bit,corr_threshold,13)
+            for start in starts:
+                bits_payload=bits_from_oversampled(s_d_os[start:],cycles_per_bit)
+                if bits_payload.size>=13:
+                    v13=bits_to_int(bits_payload[:13])
+                    temp_c,temp_f=v13_to_temp(v13)
+                    write_csv(csv_path,temp_c,temp_f,"rtlsdr",f"v13={v13}")
+                    print(f"[RTLSDR] v13={v13:013b} → {
