@@ -174,7 +174,7 @@ class RadioRecorder:
             return
         self.stop_flag = False
         self.recording = True
-        self.thread = threading.Thread(target=self._record_loop, daemon=True)
+        self.thread = threading.Thread(target=self._record_loop)
         self.thread.start()
 
     def stop(self):
@@ -207,7 +207,8 @@ class BaseController(Controller):
         rc.SpeedM2(address1, 0)
         rc.SpeedM1(address2, 0)
         rc.SpeedM2(address2, 0)
-        radio_recorder.stop()
+        if radio_recorder.thread is not None:
+            radio_recorder.thread.join()
         radio_recorder.close()
         sys.exit(0)
 
