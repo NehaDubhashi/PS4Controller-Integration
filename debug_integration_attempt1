@@ -72,7 +72,7 @@ class RadioRecorder:
         print("RadioRecorder: Recording started.")
         start_time = time.time()
 
-        while ((not self.stop_flag) or (len(sample_blocks) < MIN_BLOCKS)) and (time.time() - start_time) < 90:
+        while (not self.stop_flag) and (time.time() - start_time) < 90:
             block = self.sdr.read_samples(block_size)
             print("DEBUG: block size returned =", len(block))
             sample_blocks.append(block)
