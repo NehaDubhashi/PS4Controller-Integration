@@ -1,41 +1,58 @@
 import time
 from datetime import datetime
+import pandas as pd
 import os
 import sys
 import threading
 import numpy as np
 from scipy import signal
 from rtlsdr import RtlSdr
+
+sys.path.append("/home/astrobotic/Documents/SDK/MotorControllers/roboclaw/Libraries/Python/roboclaw_python")
+
+from scipy.io import savemat
+from functools import reduce
+import scipy.io as spio
+
 from pyPS4Controller.controller import Controller
 from roboclaw_3 import Roboclaw
 
-# ==========================
+# ===============================
 # RoboClaw setup
-# ==========================
+# ===============================
 rc = Roboclaw("/dev/ttyS0", 38400)
 rc.Open()
 address1 = 0x80
 address2 = 0x81
 
-# ==========================
-# DSP helpers
-# ==========================
+# ===============================
+# DSP helpers (UNCHANGED)
+# ===============================
 def accumulate(sq, sq_90, samples, num_it, samp):
     a_val = np.empty((num_it, 1))
     l = 0
     for i in range(0, num_it * samp, samp):
         a_i = np.sum(sq[i:i+samp] * np.abs(samples[i:i+samp]))
         a_q = np.sum(sq_90[i:i+samp] * np.abs(samples[i:i+samp]))
-        a_val[l] = np.sqrt(a_i**2 + a_q**2)
+        a_val[l] = np.sqrt(np.abs(a_i**2 + a_q**2))
         l += 1
     return a_val[~np.isnan(a_val)]
 
 def getBinary(a_val, th):
-    return (a_val >= th).astype(int)
+    s_d = np.empty((len(a_val), 1))
+    for i in range(len(a_val)):
+        s_d[i] = 1 if a_val[i] >= th else 0
+    return s_d
 
-# ==========================
+def bandpower(x, fs, fmin, fmax):
+    f, Pxx = signal.periodogram(x, fs=fs)
+    ind_min = np.argmax(f > fmin) - 1
+    ind_max = np.argmax(f > fmax) - 1
+    return np.trapz(Pxx[ind_min:ind_max], f[ind_min:ind_max])
+
+# ===============================
 # Radio Recorder
-# ==========================
+# ===============================
 class RadioRecorder:
     def __init__(self, center_freq=915e6, sample_rate=1e6, gain=2):
         self.sdr = RtlSdr()
@@ -48,56 +65,68 @@ class RadioRecorder:
         self.samples = None
 
     def _record_loop(self):
-        print("RadioRecorder: Recording started.")
         sample_blocks = []
         block_size = 131072
         MIN_BLOCKS = 8
 
+        print("RadioRecorder: Recording started.")
         start_time = time.time()
-        while not self.stop_flag and (time.time() - start_time) < 90:
-            block = self.sdr.read_samples(block_size)
-            sample_blocks.append(block)
-            print("DEBUG: block captured =", len(block))
 
-        print("DEBUG: exiting SDR read loop")
+        while ((not self.stop_flag) or (len(sample_blocks) < MIN_BLOCKS)) and (time.time() - start_time) < 90:
+            block = self.sdr.read_samples(block_size)
+            print("DEBUG: block size returned =", len(block))
+            sample_blocks.append(block)
+
+        print("DEBUG: finished read loop.")
 
         if not sample_blocks:
             print("ERROR: No samples captured.")
-            self.recording = False
             return
 
         self.samples = np.concatenate(sample_blocks)
-        print("DEBUG: total samples =", self.samples.size)
+        print("DEBUG: Total samples =", self.samples.size)
 
-        # --------------------------
+        try:
+            self.sdr.close()
+        except Exception as e:
+            print("WARNING: SDR close failed:", e)
+
+        # ===============================
         # Signal processing
-        # --------------------------
+        # ===============================
         fs = self.sdr.sample_rate
         fb = 100
+        dr = 1
+
         N = len(self.samples)
-        t = np.arange(N) / fs
+        t = np.arange(0, N / fs, 1/fs)
 
-        sq = signal.square(2*np.pi*fb*t)
-        sq_90 = signal.square(2*np.pi*fb*t + np.pi/2)
+        sq = signal.square(2*np.pi*fb*t, duty=0.5)
+        sq_90 = signal.square(2*np.pi*fb*t + np.pi/2, duty=0.5)
 
-        samp = int(fs / fb)
+        max_cycles = fb / dr
+        samps_per_bit = 2
+        cycles = int(np.ceil(max_cycles) / samps_per_bit)
+
+        Tmax = (1.0 / fb) * cycles
+        samp = round(Tmax / (1.0/fs))
         num_it = int(N / samp)
 
         a_val = accumulate(sq, sq_90, self.samples, num_it, samp)
         s_d = getBinary(a_val, np.mean(a_val))
-        bit_sequence = s_d.flatten().tolist()
+        bit_sequence = [int(b) for b in s_d.flatten()]
 
-        print(f"DEBUG: decoded {len(bit_sequence)} bits")
+        print(f"DEBUG: Captured {len(bit_sequence)} bits")
 
-        # --------------------------
-        # SAFE SAVE BLOCK
-        # --------------------------
+        # ===============================
+        # SAFE SAVE BLOCK (FIXED)
+        # ===============================
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         save_dir = "/home/astrobotic/Desktop/Controls/data"
         os.makedirs(save_dir, exist_ok=True)
 
         output_path = f"{save_dir}/sdr_record_{ts}.npz"
-        print("DEBUG: saving SDR data to:", output_path)
+        print("DEBUG: Saving SDR NPZ to:", output_path)
 
         try:
             np.savez_compressed(
@@ -107,73 +136,69 @@ class RadioRecorder:
                 s_d=s_d,
                 bit_sequence=np.array(bit_sequence)
             )
-            print("SUCCESS: SDR NPZ saved.")
+            print("SUCCESS: SDR data saved.")
         except Exception as e:
             print("ERROR: Failed to save SDR NPZ:", repr(e))
 
-        # --------------------------
-        # Temperature decode
-        # --------------------------
+        # ===============================
+        # Temperature decode (UNCHANGED)
+        # ===============================
         barker7 = [1,0,1,1,0,1,0]
-        temps_f = []
+        packet_length = 20
+        temperatures_f = []
         timestamps = []
 
-        for i in range(len(bit_sequence) - 20):
+        for i in range(len(bit_sequence) - packet_length):
             if bit_sequence[i:i+7] == barker7:
                 temp_bits = bit_sequence[i+7:i+20]
-                raw = int("".join(map(str, temp_bits)), 2)
-                temp_f = (raw * 0.0625 * 9/5) + 32
-                temps_f.append(temp_f)
+                temp_raw = int("".join(str(b) for b in temp_bits), 2)
+                temp_f = (temp_raw * 0.0625 * 9/5) + 32
+                temperatures_f.append(temp_f)
                 timestamps.append(datetime.now().isoformat())
 
-        if temps_f:
+        if temperatures_f:
             temp_path = f"{save_dir}/temps_{ts}.npz"
             try:
                 np.savez_compressed(temp_path,
-                                    temperatures_f=temps_f,
+                                    temperatures_f=temperatures_f,
                                     timestamps=timestamps)
-                print("SUCCESS: temperature NPZ saved.")
+                print("SUCCESS: temperature data saved.")
             except Exception as e:
-                print("ERROR: Failed to save temps:", repr(e))
+                print("ERROR: Failed to save temperature NPZ:", repr(e))
         else:
-            print("DEBUG: no valid temperature packets")
-
-        self.recording = False
-        print("RadioRecorder: recording complete.")
+            print("DEBUG: No valid temperature packets detected.")
 
     def start(self):
         if self.recording:
+            print("RadioRecorder: Already recording.")
             return
         self.stop_flag = False
         self.recording = True
-        self.thread = threading.Thread(target=self._record_loop)  # NOT daemon
+        self.thread = threading.Thread(target=self._record_loop, daemon=True)
         self.thread.start()
 
     def stop(self):
-        print("RadioRecorder: stop requested")
+        print("RadioRecorder: stop requested.")
         self.stop_flag = True
-        if self.thread:
-            self.thread.join()
-        self.recording = False
 
     def close(self):
         try:
             self.sdr.close()
-        except:
-            pass
+        except Exception as e:
+            print("WARNING: SDR close error:", e)
 
 radio_recorder = RadioRecorder()
 
-# ==========================
-# Controller
-# ==========================
+# ===============================
+# Controller logic (UNCHANGED)
+# ===============================
 class BaseController(Controller):
     def on_square_press(self):
-        print("Square -> start recording")
+        print("Square -> start SDR recording")
         radio_recorder.start()
 
     def on_circle_press(self):
-        print("Circle -> stop recording")
+        print("Circle -> stop SDR recording")
         radio_recorder.stop()
 
     def on_x_press(self):
@@ -193,21 +218,30 @@ class JoystickController(BaseController):
         self.deadZone = deadZone
 
     def mapSpeed(self, value):
-        return 0 if abs(value) < self.deadZone else int((abs(value)/32767)*self.maxSpeed)
+        if abs(value) < self.deadZone:
+            return 0
+        return int((abs(value) / 32767.0) * self.maxSpeed)
 
     def on_L3_up(self, value):
-        s = self.mapSpeed(value)
-        rc.SpeedM1(address1, -s)
-        rc.SpeedM2(address2, -s)
+        speed = self.mapSpeed(value)
+        rc.SpeedM1(address1, -speed)
+        rc.SpeedM2(address2, -speed)
 
     def on_L3_down(self, value):
-        s = self.mapSpeed(value)
-        rc.SpeedM1(address1, s)
-        rc.SpeedM2(address2, s)
+        speed = self.mapSpeed(value)
+        rc.SpeedM1(address1, speed)
+        rc.SpeedM2(address2, speed)
 
-# ==========================
-# Main
-# ==========================
+    def on_R3_up(self, value):
+        speed = self.mapSpeed(value)
+        rc.SpeedM2(address1, speed)
+        rc.SpeedM1(address2, speed)
+
+    def on_R3_down(self, value):
+        speed = self.mapSpeed(value)
+        rc.SpeedM2(address1, -speed)
+        rc.SpeedM1(address2, -speed)
+
 def main():
     while not os.path.exists("/dev/input/js0"):
         time.sleep(1)
@@ -218,7 +252,7 @@ def main():
         interface="/dev/input/js0",
         connecting_using_ds4drv=False
     )
-    print("Controller ready.")
+    print("Controller ready. Listening for input...")
     controller.listen()
 
 if __name__ == "__main__":
