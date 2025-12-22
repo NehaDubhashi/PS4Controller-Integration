@@ -39,6 +39,9 @@ class RadioRecorder:
         # outputs
         self.a_vals = []
 
+        # streaming symbol buffer (CRITICAL FIX)
+        self.sym_buf = np.array([], dtype=np.complex64)
+
         # raw sync (debug only)
         self.RAW_SYNC_MAX_SAMPLES = int(1 * sample_rate)  # 1 second
         self.raw_sync_buf = []
@@ -59,13 +62,22 @@ class RadioRecorder:
             dr = 1
             block_size = 131072
 
+            # symbol timing (same math as notebook)
+            max_cycles = fb / dr
+            samps_per_bit = 2
+            cycles = int(np.ceil(max_cycles) / samps_per_bit)
+            Tmax = (1.0 / fb) * cycles
+            samp = int(Tmax * fs)
+
             print("RadioRecorder: Recording started")
+            print(f"DEBUG: samp = {samp}, block_size = {block_size}")
 
             start_time = time.time()
             while not self.stop_flag and (time.time() - start_time) < 90:
                 block = self.sdr.read_samples(block_size)
+                print("DEBUG: block length =", len(block))
 
-                # ---------- RAW SYNC (LIMITED) ----------
+                # ---------- RAW SYNC (LIMITED, DIAGNOSTIC) ----------
                 if self.raw_sync_count < self.RAW_SYNC_MAX_SAMPLES:
                     t = np.arange(len(block)) / fs
                     sq = signal.square(2 * np.pi * fb * t)
@@ -78,19 +90,18 @@ class RadioRecorder:
                     self.raw_sync_buf.append(raw_mag[:remaining])
                     self.raw_sync_count += len(raw_mag[:remaining])
 
-                # ---------- SYMBOL-LEVEL ACCUMULATION ----------
-                max_cycles = fb / dr
-                samps_per_bit = 2
-                cycles = int(np.ceil(max_cycles) / samps_per_bit)
-                Tmax = (1.0 / fb) * cycles
-                samp = int(Tmax * fs)
+                # ---------- SYMBOL-LEVEL ACCUMULATION (BUFFERED) ----------
+                self.sym_buf = np.concatenate((self.sym_buf, block))
 
-                for i in range(0, len(block) - samp, samp):
+                while len(self.sym_buf) >= samp:
+                    segment = self.sym_buf[:samp]
+                    self.sym_buf = self.sym_buf[samp:]
+
                     t_sym = np.arange(samp) / fs
                     sq = signal.square(2 * np.pi * fb * t_sym)
                     sq90 = signal.square(2 * np.pi * fb * t_sym + np.pi / 2)
 
-                    env = np.abs(block[i:i+samp])
+                    env = np.abs(segment)
                     a_i = np.sum(sq * env)
                     a_q = np.sum(sq90 * env)
                     a = np.sqrt(a_i**2 + a_q**2)
@@ -112,7 +123,7 @@ class RadioRecorder:
 
     def _finalize_and_save(self):
         if not self.a_vals:
-            print("No data captured; nothing to save")
+            print("ERROR: No data captured — a_vals empty")
             return
 
         a_val = np.array(self.a_vals)
@@ -137,6 +148,7 @@ class RadioRecorder:
         )
 
         print(f"SUCCESS: Saved capture to {out}")
+        print(f"DEBUG: symbols captured = {len(a_val)}")
 
     def start(self):
         if self.recording:
