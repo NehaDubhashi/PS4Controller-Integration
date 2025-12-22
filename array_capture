@@ -1,0 +1,5 @@
+import numpy as np
+
+data = np.load(home/astrobotic/Desktop/Controls/data/sdr_record_20251221_160141.npz")
+
+print(data.files)
