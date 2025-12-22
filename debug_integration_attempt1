@@ -55,139 +55,133 @@ def bandpower(x, fs, fmin, fmax):
 # ===============================
 class RadioRecorder:
     def __init__(self, center_freq=915e6, sample_rate=1e6, gain=2):
-        self.sdr = RtlSdr()
-        self.sdr.sample_rate = sample_rate
-        self.sdr.center_freq = center_freq
-        self.sdr.gain = gain
+        self.center_freq = center_freq
+        self.sample_rate = sample_rate
+        self.gain = gain
+
+        self.sdr = None
         self.recording = False
         self.stop_flag = False
         self.thread = None
-        self.samples = None
+
+        # outputs
+        self.a_vals = []
+        self.bits = []
+
+        # raw sync capture (DEBUG ONLY)
+        self.RAW_SYNC_MAX_SAMPLES = int(1 * sample_rate)  # 1 second
+        self.raw_sync_buf = []
+        self.raw_sync_count = 0
+
+    def _open_sdr(self):
+        self.sdr = RtlSdr()
+        self.sdr.sample_rate = self.sample_rate
+        self.sdr.center_freq = self.center_freq
+        self.sdr.gain = self.gain
 
     def _record_loop(self):
-        sample_blocks = []
-        block_size = 131072
-        MIN_BLOCKS = 8
-
-        print("RadioRecorder: Recording started.")
-        start_time = time.time()
-
-        while (not self.stop_flag) and (time.time() - start_time) < 90:
-            block = self.sdr.read_samples(block_size)
-            print("DEBUG: block size returned =", len(block))
-            sample_blocks.append(block)
-
-        print("DEBUG: finished read loop.")
-
-        if not sample_blocks:
-            print("ERROR: No samples captured.")
-            return
-
-        self.samples = np.concatenate(sample_blocks)
-        print("DEBUG: Total samples =", self.samples.size)
-
         try:
-            self.sdr.close()
-        except Exception as e:
-            print("WARNING: SDR close failed:", e)
+            self._open_sdr()
 
-        # ===============================
-        # Signal processing
-        # ===============================
-        fs = self.sdr.sample_rate
-        fb = 100
-        dr = 1
+            block_size = 131072
+            fb = 100
+            dr = 1
+            fs = self.sample_rate
 
-        N = len(self.samples)
-        t = np.arange(0, N / fs, 1/fs)
+            print("RadioRecorder: Recording started")
 
-        sq = signal.square(2*np.pi*fb*t, duty=0.5)
-        sq_90 = signal.square(2*np.pi*fb*t + np.pi/2, duty=0.5)
+            start_time = time.time()
+            while (not self.stop_flag) and (time.time() - start_time) < 90:
+                block = self.sdr.read_samples(block_size)
 
-        max_cycles = fb / dr
-        samps_per_bit = 2
-        cycles = int(np.ceil(max_cycles) / samps_per_bit)
+                # ---------- RAW SYNC (sample-level, LIMITED) ----------
+                if self.raw_sync_count < self.RAW_SYNC_MAX_SAMPLES:
+                    t = np.arange(len(block)) / fs
+                    sq = signal.square(2 * np.pi * fb * t)
+                    sq_90 = signal.square(2 * np.pi * fb * t + np.pi/2)
 
-        Tmax = (1.0 / fb) * cycles
-        samp = round(Tmax / (1.0/fs))
-        num_it = int(N / samp)
+                    I = sq * np.abs(block)
+                    Q = sq_90 * np.abs(block)
+                    raw_mag = np.sqrt(I**2 + Q**2)
 
-        a_val = accumulate(sq, sq_90, self.samples, num_it, samp)
-        s_d = getBinary(a_val, np.mean(a_val))
-        bit_sequence = [int(b) for b in s_d.flatten()]
+                    remaining = self.RAW_SYNC_MAX_SAMPLES - self.raw_sync_count
+                    self.raw_sync_buf.append(raw_mag[:remaining])
+                    self.raw_sync_count += len(raw_mag[:remaining])
 
-        print(f"DEBUG: Captured {len(bit_sequence)} bits")
+                # ---------- SYMBOL-LEVEL ACCUMULATION ----------
+                max_cycles = fb / dr
+                samps_per_bit = 2
+                cycles = int(np.ceil(max_cycles) / samps_per_bit)
+                Tmax = (1.0 / fb) * cycles
+                samp = int(Tmax * fs)
 
-        # ===============================
-        # SAFE SAVE BLOCK (FIXED)
-        # ===============================
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        save_dir = "/home/astrobotic/Desktop/Controls/data"
-        os.makedirs(save_dir, exist_ok=True)
+                for i in range(0, len(block) - samp, samp):
+                    t_sym = np.arange(samp) / fs
+                    sq_sym = signal.square(2 * np.pi * fb * t_sym)
+                    sq90_sym = signal.square(2 * np.pi * fb * t_sym + np.pi/2)
+                    
+                    env = np.abs(block[i:i+samp])
+                    a_i = np.sum(sq_sym * env)
+                    a_q = np.sum(sq90_sym * env)
+                    a = np.sqrt(a_i**2 + a_q**2)
+                    self.a_vals.append(a)
 
-        output_path = f"{save_dir}/sdr_record_{ts}.npz"
-        print("DEBUG: Saving SDR NPZ to:", output_path)
+            print("RadioRecorder: Finished acquisition")
 
-        try:
-            np.savez_compressed(
-                output_path,
-                samples=self.samples,
-                a_val=a_val,
-                s_d=s_d,
-                bit_sequence=np.array(bit_sequence)
-            )
-            print("SUCCESS: SDR data saved.")
-        except Exception as e:
-            print("ERROR: Failed to save SDR NPZ:", repr(e))
-
-        # ===============================
-        # Temperature decode (UNCHANGED)
-        # ===============================
-        barker7 = [1,0,1,1,0,1,0]
-        packet_length = 20
-        temperatures_f = []
-        timestamps = []
-
-        for i in range(len(bit_sequence) - packet_length):
-            if bit_sequence[i:i+7] == barker7:
-                temp_bits = bit_sequence[i+7:i+20]
-                temp_raw = int("".join(str(b) for b in temp_bits), 2)
-                temp_f = (temp_raw * 0.0625 * 9/5) + 32
-                temperatures_f.append(temp_f)
-                timestamps.append(datetime.now().isoformat())
-
-        if temperatures_f:
-            temp_path = f"{save_dir}/temps_{ts}.npz"
+        finally:
             try:
-                np.savez_compressed(temp_path,
-                                    temperatures_f=temperatures_f,
-                                    timestamps=timestamps)
-                print("SUCCESS: temperature data saved.")
-            except Exception as e:
-                print("ERROR: Failed to save temperature NPZ:", repr(e))
-        else:
-            print("DEBUG: No valid temperature packets detected.")
+                self.sdr.close()
+            except:
+                pass
+
+            self._finalize_and_save()
+
+            self.recording = False
+            self.stop_flag = False
+            print("RadioRecorder: Recording thread exited cleanly")
+
+    def _finalize_and_save(self):
+        a_val = np.array(self.a_vals)
+        threshold = np.mean(a_val)
+        s_d = (a_val >= threshold).astype(int)
+
+        raw_sync = None
+        if self.raw_sync_buf:
+            raw_sync = np.concatenate(self.raw_sync_buf)
+
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        out = f"/home/astrobotic/Desktop/Controls/data/sdr_record_{ts}.npz"
+
+        np.savez_compressed(
+            out,
+            a_val=a_val,
+            bit_sequence=s_d,
+            raw_sync=raw_sync,
+            fs=self.sample_rate,
+            fb=100
+        )
+
+        print(f"SUCCESS: Saved capture to {out}")
 
     def start(self):
         if self.recording:
-            print("RadioRecorder: Already recording.")
+            print("RadioRecorder: Already recording")
             return
+
         self.stop_flag = False
         self.recording = True
         self.thread = threading.Thread(target=self._record_loop)
         self.thread.start()
 
     def stop(self):
-        print("RadioRecorder: stop requested.")
+        if not self.recording:
+            return
+        print("RadioRecorder: stop requested")
         self.stop_flag = True
 
     def close(self):
-        try:
-            self.sdr.close()
-        except Exception as e:
-            print("WARNING: SDR close error:", e)
-
-radio_recorder = RadioRecorder()
+        if self.thread is not None:
+            self.thread.join()
 
 # ===============================
 # Controller logic (UNCHANGED)
