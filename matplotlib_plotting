@@ -1,46 +1,50 @@
-import glob
 import numpy as np
 import matplotlib.pyplot as plt
+import glob
 
-# -------------------------------
-# Load latest capture
-# -------------------------------
-files = sorted(
-    glob.glob("/home/astrobotic/Desktop/Controls/data/sdr_record_*.npz")
-)
+# -----------------------------
+# Load latest SDR capture
+# -----------------------------
+files = sorted(glob.glob("/home/astrobotic/Desktop/Controls/data/sdr_record_*.npz"))
 latest = files[-1]
 print("Loading:", latest)
 
 data = np.load(latest)
-a_val = data["a_val"].flatten()
 
-# Binary decision (same as before)
+# REQUIRED fields
+a_val = data["a_val"]          # shape: (N, 1) or (N,)
+a_val = a_val.flatten()
+
+# -----------------------------
+# Notebook logic (unchanged)
+# -----------------------------
+a_val_norm = a_val / np.linalg.norm(a_val, ord=np.inf)
+
 def getBinary(a_val, th):
-    return (a_val >= th).astype(int)
+    s_d = np.zeros(len(a_val))
+    for i in range(len(a_val)):
+        s_d[i] = 1 if a_val[i] >= th else 0
+    return s_d
 
-threshold = np.mean(a_val)
-s_d = getBinary(a_val, threshold)
+s_d = getBinary(a_val, np.mean(a_val))
 
 print("Mean(a_val):", np.mean(a_val))
+print("Mean(a_val_norm):", np.mean(a_val_norm))
 print("Num symbols:", len(a_val))
 
-# -------------------------------
-# Plot
-# -------------------------------
+# -----------------------------
+# Plot (EXACT notebook style)
+# -----------------------------
 plt.figure(figsize=(8, 6))
 
-# ---- Top: synchronous detection output (integrated) ----
 plt.subplot(2, 1, 1)
-plt.plot(a_val, '.-', markersize=6)
-plt.axhline(threshold, linestyle='--')
+plt.plot(a_val, '.-')
 plt.title('Signal after Synchronous Detection')
 plt.ylabel('Accumulator Magnitude')
 plt.grid(True)
 
-# ---- Bottom: 0/1 representation ----
 plt.subplot(2, 1, 2)
 plt.plot(s_d, '.-')
-plt.ylim(-0.2, 1.2)
 plt.title('Signal in 0/1s Representation')
 plt.xlabel('Symbol Index')
 plt.ylabel('Bit')
@@ -49,5 +53,7 @@ plt.grid(True)
 plt.tight_layout()
 
 out = latest.replace(".npz", "_sync_detect.png")
-plt.savefig(out)
+plt.savefig(out, dpi=150)
 print("Saved plot to:", out)
+
+plt.show()
