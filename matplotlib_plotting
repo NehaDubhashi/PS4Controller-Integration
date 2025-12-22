@@ -1,0 +1,21 @@
+import numpy as np
+import matplotlib
+matplotlib.use("Agg")   # IMPORTANT: headless backend
+import matplotlib.pyplot as plt
+
+data = np.load("home/astrobotic/Desktop/Controls/data/sdr_record_20251221_160141.npz")
+
+a_val = data["a_val"].flatten()
+bits = data["bit_sequence"]
+
+plt.figure(figsize=(10, 4))
+plt.plot(a_val, label="Accumulator magnitude")
+plt.axhline(a_val.mean(), color="r", linestyle="--", label="Threshold")
+plt.title("Accumulator Output")
+plt.xlabel("Symbol index")
+plt.ylabel("Magnitude")
+plt.legend()
+plt.tight_layout()
+
+plt.savefig("data/accumulator_plot.png")
+print("Saved plot to data/accumulator_plot.png")
