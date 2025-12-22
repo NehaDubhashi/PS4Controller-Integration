@@ -1,25 +1,56 @@
+import glob
 import numpy as np
 import matplotlib.pyplot as plt
 
-# --- Normalize ONLY for visualization ---
-a_val = a_val.flatten()
+# -------------------------------
+# Load latest SDR capture
+# -------------------------------
+files = sorted(
+    glob.glob("/home/astrobotic/Desktop/Controls/data/sdr_record_*.npz")
+)
+
+if not files:
+    raise RuntimeError("No SDR capture files found.")
+
+latest = files[-1]
+print("Loading:", latest)
+
+data = np.load(latest)
+
+# -------------------------------
+# Extract arrays
+# -------------------------------
+a_val = data["a_val"].flatten()
+
+# Binary decision function (define locally)
+def getBinary(a_val, th):
+    return (a_val >= th).astype(int)
+
+# -------------------------------
+# Normalize ONLY for visualization
+# -------------------------------
 a_val_norm = a_val / np.max(np.abs(a_val))
 
-# --- Binary decision (use raw values, not normalized) ---
+# -------------------------------
+# Binary decision (raw values)
+# -------------------------------
 threshold = np.mean(a_val)
-s_d = getBinary(a_val, threshold).flatten()
+s_d = getBinary(a_val, threshold)
 
 print("Mean(a_val):", np.mean(a_val))
 print("Mean(a_val_norm):", np.mean(a_val_norm))
 print("Num symbols:", len(a_val))
 
-# --- Plot ---
+# -------------------------------
+# Plot
+# -------------------------------
 plt.figure(figsize=(10, 6))
 
 # Top: synchronous detection output (integrated)
 plt.subplot(2, 1, 1)
 plt.plot(a_val_norm, '.-', label='Accumulator (normalized)')
-plt.axhline(threshold / np.max(a_val), color='r', linestyle='--', label='Threshold')
+plt.axhline(threshold / np.max(a_val),
+            color='r', linestyle='--', label='Threshold')
 plt.title('Signal after Synchronous Detection')
 plt.ylabel('Normalized Magnitude')
 plt.legend()
@@ -35,4 +66,11 @@ plt.ylabel('Bit')
 plt.grid(True)
 
 plt.tight_layout()
-plt.show()  # or plt.savefig(...) on the Pi
+
+# Use savefig on the Pi
+out = latest.replace(".npz", "_sync_detect.png")
+plt.savefig(out)
+print("Saved plot to:", out)
+
+# Uncomment ONLY if running with a display
+# plt.show()
