@@ -1,21 +1,47 @@
+import glob
 import numpy as np
 import matplotlib
-matplotlib.use("Agg")   # IMPORTANT: headless backend
+matplotlib.use("Agg")  # headless backend for Pi / SSH
 import matplotlib.pyplot as plt
+import os
 
-data = np.load("home/astrobotic/Desktop/Controls/data/sdr_record_20251221_160141.npz")
+# Directory containing SDR captures
+DATA_DIR = "/home/astrobotic/Desktop/Controls/data"
 
+# Find all SDR capture files
+files = sorted(glob.glob(os.path.join(DATA_DIR, "sdr_record_*.npz")))
+
+if not files:
+    raise FileNotFoundError("No SDR capture files found in data directory.")
+
+# Pick the most recent file
+latest_file = files[-1]
+print("Loading latest capture:", latest_file)
+
+# Load data
+data = np.load(latest_file)
+
+# Extract arrays
 a_val = data["a_val"].flatten()
 bits = data["bit_sequence"]
 
+# Plot accumulator output
 plt.figure(figsize=(10, 4))
 plt.plot(a_val, label="Accumulator magnitude")
 plt.axhline(a_val.mean(), color="r", linestyle="--", label="Threshold")
-plt.title("Accumulator Output")
+plt.title("Accumulator Output (Latest SDR Capture)")
 plt.xlabel("Symbol index")
 plt.ylabel("Magnitude")
 plt.legend()
 plt.tight_layout()
 
-plt.savefig("data/accumulator_plot.png")
-print("Saved plot to data/accumulator_plot.png")
+# Save plot alongside data
+plot_path = latest_file.replace(".npz", "_accumulator.png")
+plt.savefig(plot_path)
+plt.close()
+
+print("Saved plot to:", plot_path)
+
+# Print decoded bits
+print("Decoded bits ({} total):".format(len(bits)))
+print(bits)
