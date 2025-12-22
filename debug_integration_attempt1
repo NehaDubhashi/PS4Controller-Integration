@@ -189,11 +189,11 @@ class RadioRecorder:
 class BaseController(Controller):
     def on_square_press(self):
         print("Square -> start SDR recording")
-        radio_recorder.start()
+        RadioRecorder.start()
 
     def on_circle_press(self):
         print("Circle -> stop SDR recording")
-        radio_recorder.stop()
+        RadioRecorder.stop()
 
     def on_x_press(self):
         print("X -> emergency stop")
@@ -201,9 +201,9 @@ class BaseController(Controller):
         rc.SpeedM2(address1, 0)
         rc.SpeedM1(address2, 0)
         rc.SpeedM2(address2, 0)
-        if radio_recorder.thread is not None:
-            radio_recorder.thread.join()
-        radio_recorder.close()
+        if RadioRecorder.thread is not None:
+            RadioRecorder.thread.join()
+        RadioRecorder.close()
         sys.exit(0)
 
 class JoystickController(BaseController):
