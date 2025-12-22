@@ -1,6 +1,5 @@
 import time
 from datetime import datetime
-import pandas as pd
 import os
 import sys
 import threading
@@ -8,11 +7,9 @@ import numpy as np
 from scipy import signal
 from rtlsdr import RtlSdr
 
-sys.path.append("/home/astrobotic/Documents/SDK/MotorControllers/roboclaw/Libraries/Python/roboclaw_python")
-
-from scipy.io import savemat
-from functools import reduce
-import scipy.io as spio
+sys.path.append(
+    "/home/astrobotic/Documents/SDK/MotorControllers/roboclaw/Libraries/Python/roboclaw_python"
+)
 
 from pyPS4Controller.controller import Controller
 from roboclaw_3 import Roboclaw
@@ -26,31 +23,6 @@ address1 = 0x80
 address2 = 0x81
 
 # ===============================
-# DSP helpers (UNCHANGED)
-# ===============================
-def accumulate(sq, sq_90, samples, num_it, samp):
-    a_val = np.empty((num_it, 1))
-    l = 0
-    for i in range(0, num_it * samp, samp):
-        a_i = np.sum(sq[i:i+samp] * np.abs(samples[i:i+samp]))
-        a_q = np.sum(sq_90[i:i+samp] * np.abs(samples[i:i+samp]))
-        a_val[l] = np.sqrt(np.abs(a_i**2 + a_q**2))
-        l += 1
-    return a_val[~np.isnan(a_val)]
-
-def getBinary(a_val, th):
-    s_d = np.empty((len(a_val), 1))
-    for i in range(len(a_val)):
-        s_d[i] = 1 if a_val[i] >= th else 0
-    return s_d
-
-def bandpower(x, fs, fmin, fmax):
-    f, Pxx = signal.periodogram(x, fs=fs)
-    ind_min = np.argmax(f > fmin) - 1
-    ind_max = np.argmax(f > fmax) - 1
-    return np.trapz(Pxx[ind_min:ind_max], f[ind_min:ind_max])
-
-# ===============================
 # Radio Recorder
 # ===============================
 class RadioRecorder:
@@ -60,15 +32,14 @@ class RadioRecorder:
         self.gain = gain
 
         self.sdr = None
+        self.thread = None
         self.recording = False
         self.stop_flag = False
-        self.thread = None
 
         # outputs
         self.a_vals = []
-        self.bits = []
 
-        # raw sync capture (DEBUG ONLY)
+        # raw sync (debug only)
         self.RAW_SYNC_MAX_SAMPLES = int(1 * sample_rate)  # 1 second
         self.raw_sync_buf = []
         self.raw_sync_count = 0
@@ -83,26 +54,25 @@ class RadioRecorder:
         try:
             self._open_sdr()
 
-            block_size = 131072
+            fs = self.sample_rate
             fb = 100
             dr = 1
-            fs = self.sample_rate
+            block_size = 131072
 
             print("RadioRecorder: Recording started")
 
             start_time = time.time()
-            while (not self.stop_flag) and (time.time() - start_time) < 90:
+            while not self.stop_flag and (time.time() - start_time) < 90:
                 block = self.sdr.read_samples(block_size)
 
-                # ---------- RAW SYNC (sample-level, LIMITED) ----------
+                # ---------- RAW SYNC (LIMITED) ----------
                 if self.raw_sync_count < self.RAW_SYNC_MAX_SAMPLES:
                     t = np.arange(len(block)) / fs
                     sq = signal.square(2 * np.pi * fb * t)
-                    sq_90 = signal.square(2 * np.pi * fb * t + np.pi/2)
+                    sq90 = signal.square(2 * np.pi * fb * t + np.pi / 2)
 
-                    I = sq * np.abs(block)
-                    Q = sq_90 * np.abs(block)
-                    raw_mag = np.sqrt(I**2 + Q**2)
+                    env = np.abs(block)
+                    raw_mag = np.sqrt((sq * env) ** 2 + (sq90 * env) ** 2)
 
                     remaining = self.RAW_SYNC_MAX_SAMPLES - self.raw_sync_count
                     self.raw_sync_buf.append(raw_mag[:remaining])
@@ -117,12 +87,12 @@ class RadioRecorder:
 
                 for i in range(0, len(block) - samp, samp):
                     t_sym = np.arange(samp) / fs
-                    sq_sym = signal.square(2 * np.pi * fb * t_sym)
-                    sq90_sym = signal.square(2 * np.pi * fb * t_sym + np.pi/2)
-                    
+                    sq = signal.square(2 * np.pi * fb * t_sym)
+                    sq90 = signal.square(2 * np.pi * fb * t_sym + np.pi / 2)
+
                     env = np.abs(block[i:i+samp])
-                    a_i = np.sum(sq_sym * env)
-                    a_q = np.sum(sq90_sym * env)
+                    a_i = np.sum(sq * env)
+                    a_q = np.sum(sq90 * env)
                     a = np.sqrt(a_i**2 + a_q**2)
                     self.a_vals.append(a)
 
@@ -130,24 +100,29 @@ class RadioRecorder:
 
         finally:
             try:
-                self.sdr.close()
+                if self.sdr:
+                    self.sdr.close()
             except:
                 pass
 
             self._finalize_and_save()
-
             self.recording = False
             self.stop_flag = False
             print("RadioRecorder: Recording thread exited cleanly")
 
     def _finalize_and_save(self):
+        if not self.a_vals:
+            print("No data captured; nothing to save")
+            return
+
         a_val = np.array(self.a_vals)
         threshold = np.mean(a_val)
-        s_d = (a_val >= threshold).astype(int)
+        bit_sequence = (a_val >= threshold).astype(int)
 
-        raw_sync = None
-        if self.raw_sync_buf:
-            raw_sync = np.concatenate(self.raw_sync_buf)
+        raw_sync = (
+            np.concatenate(self.raw_sync_buf)
+            if self.raw_sync_buf else None
+        )
 
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         out = f"/home/astrobotic/Desktop/Controls/data/sdr_record_{ts}.npz"
@@ -155,7 +130,7 @@ class RadioRecorder:
         np.savez_compressed(
             out,
             a_val=a_val,
-            bit_sequence=s_d,
+            bit_sequence=bit_sequence,
             raw_sync=raw_sync,
             fs=self.sample_rate,
             fb=100
@@ -180,30 +155,37 @@ class RadioRecorder:
         self.stop_flag = True
 
     def close(self):
-        if self.thread is not None:
+        if self.thread:
             self.thread.join()
+            self.thread = None
 
 # ===============================
-# Controller logic (UNCHANGED)
+# GLOBAL RECORDER INSTANCE
+# ===============================
+radio_recorder = RadioRecorder()
+
+# ===============================
+# Controller logic
 # ===============================
 class BaseController(Controller):
     def on_square_press(self):
         print("Square -> start SDR recording")
-        RadioRecorder.start()
+        radio_recorder.start()
 
     def on_circle_press(self):
         print("Circle -> stop SDR recording")
-        RadioRecorder.stop()
+        radio_recorder.stop()
 
     def on_x_press(self):
         print("X -> emergency stop")
+
         rc.SpeedM1(address1, 0)
         rc.SpeedM2(address1, 0)
         rc.SpeedM1(address2, 0)
         rc.SpeedM2(address2, 0)
-        if RadioRecorder.thread is not None:
-            RadioRecorder.thread.join()
-        RadioRecorder.close()
+
+        radio_recorder.stop()
+        radio_recorder.close()
         sys.exit(0)
 
 class JoystickController(BaseController):
@@ -237,6 +219,9 @@ class JoystickController(BaseController):
         rc.SpeedM2(address1, -speed)
         rc.SpeedM1(address2, -speed)
 
+# ===============================
+# Main
+# ===============================
 def main():
     while not os.path.exists("/dev/input/js0"):
         time.sleep(1)
@@ -247,6 +232,7 @@ def main():
         interface="/dev/input/js0",
         connecting_using_ds4drv=False
     )
+
     print("Controller ready. Listening for input...")
     controller.listen()
 
