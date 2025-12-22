@@ -1,59 +1,57 @@
+import glob
+import os
 import numpy as np
 import matplotlib.pyplot as plt
-import glob
 
-# -----------------------------
-# Load latest SDR capture
-# -----------------------------
-files = sorted(glob.glob("/home/astrobotic/Desktop/Controls/data/sdr_record_*.npz"))
+# ===============================
+# Find latest SDR capture
+# ===============================
+data_dir = "/home/astrobotic/Desktop/Controls/data"
+files = sorted(
+    glob.glob(os.path.join(data_dir, "sdr_record_*.npz")),
+    key=os.path.getmtime
+)
+
+if not files:
+    raise RuntimeError("No sdr_record_*.npz files found")
+
 latest = files[-1]
-print("Loading:", latest)
+print("Loading latest capture:")
+print(latest)
 
 data = np.load(latest)
 
-# REQUIRED fields
-a_val = data["a_val"]          # shape: (N, 1) or (N,)
-a_val = a_val.flatten()
+a_val = data["a_val"].flatten()
+s_d = data["s_d"].flatten()
 
-# -----------------------------
-# Notebook logic (unchanged)
-# -----------------------------
-a_val_norm = a_val / np.linalg.norm(a_val, ord=np.inf)
+threshold = np.mean(a_val)
 
-def getBinary(a_val, th):
-    s_d = np.zeros(len(a_val))
-    for i in range(len(a_val)):
-        s_d[i] = 1 if a_val[i] >= th else 0
-    return s_d
-
-s_d = getBinary(a_val, np.mean(a_val))
-
-print("Mean(a_val):", np.mean(a_val))
-print("Mean(a_val_norm):", np.mean(a_val_norm))
 print("Num symbols:", len(a_val))
+print("Mean(a_val):", threshold)
+print("Max(a_val):", np.max(a_val))
 
-# -----------------------------
-# Plot (EXACT notebook style)
-# -----------------------------
-plt.figure(figsize=(8, 6))
+# ===============================
+# Plot (RAW, no normalization)
+# ===============================
+plt.figure(figsize=(10, 7))
 
+# --- Top: synchronous detection output ---
 plt.subplot(2, 1, 1)
-plt.plot(a_val, '.-')
-plt.title('Signal after Synchronous Detection')
-plt.ylabel('Accumulator Magnitude')
+plt.plot(a_val, ".-", linewidth=1)
+plt.axhline(threshold, color="r", linestyle="--", label="Mean threshold")
+plt.title("Signal after Synchronous Detection")
+plt.ylabel("Accumulator Magnitude")
 plt.grid(True)
+plt.legend()
 
+# --- Bottom: binary decisions ---
 plt.subplot(2, 1, 2)
-plt.plot(s_d, '.-')
-plt.title('Signal in 0/1s Representation')
-plt.xlabel('Symbol Index')
-plt.ylabel('Bit')
+plt.step(range(len(s_d)), s_d, where="post")
+plt.ylim(-0.2, 1.2)
+plt.title("Signal in 0/1s Representation")
+plt.xlabel("Symbol Index")
+plt.ylabel("Bit")
 plt.grid(True)
 
 plt.tight_layout()
-
-out = latest.replace(".npz", "_sync_detect.png")
-plt.savefig(out, dpi=150)
-print("Saved plot to:", out)
-
 plt.show()
