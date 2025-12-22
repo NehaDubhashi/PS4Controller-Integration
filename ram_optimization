@@ -1,0 +1,243 @@
+import time
+from datetime import datetime
+import os
+import sys
+import threading
+import numpy as np
+from scipy import signal
+from rtlsdr import RtlSdr
+
+sys.path.append("/home/astrobotic/Documents/SDK/MotorControllers/roboclaw/Libraries/Python/roboclaw_python")
+
+from pyPS4Controller.controller import Controller
+from roboclaw_3 import Roboclaw
+
+# ===================== Roboclaw =====================
+rc = Roboclaw("/dev/ttyS0", 38400)
+rc.Open()
+address1 = 0x80
+address2 = 0x81
+
+# ===================== DSP helpers =====================
+def accumulate_block(samples, fs, fb=100, dr=1):
+    """
+    Process ONE block of samples and return a_val for that block.
+    This is streaming-safe and bounded in memory.
+    """
+    N = len(samples)
+    if N == 0:
+        return np.array([])
+
+    t = np.arange(N) / fs
+
+    sq = signal.square(2*np.pi*fb*t, duty=0.5)
+    sq_90 = signal.square(2*np.pi*fb*t + np.pi/2, duty=0.5)
+
+    max_cycles = fb / dr
+    samps_per_bit = 2
+    cycles = int(np.ceil(max_cycles) / samps_per_bit)
+
+    Tmax = (1.0 / fb) * cycles
+    samp = max(1, round(Tmax * fs))
+    num_it = N // samp
+
+    if num_it <= 0:
+        return np.array([])
+
+    a_val = np.empty(num_it)
+    for i in range(num_it):
+        sl = samples[i*samp:(i+1)*samp]
+        ai = np.sum(sq[i*samp:(i+1)*samp] * np.abs(sl))
+        aq = np.sum(sq_90[i*samp:(i+1)*samp] * np.abs(sl))
+        a_val[i] = np.sqrt(ai*ai + aq*aq)
+
+    return a_val[~np.isnan(a_val)]
+
+
+def getBinary(a_val, th):
+    return (a_val >= th).astype(np.int8)
+
+
+# ===================== Radio Recorder =====================
+class RadioRecorder:
+    def __init__(self, center_freq=915e6, sample_rate=1e6, gain=2):
+        self.center_freq = center_freq
+        self.sample_rate = sample_rate
+        self.gain = gain
+
+        self.recording = False
+        self.stop_flag = False
+        self.thread = None
+
+        self.a_vals = []   # STREAMED accumulator outputs
+        self.bits = []
+
+    def _record_loop(self):
+        sdr = RtlSdr()
+        sdr.sample_rate = self.sample_rate
+        sdr.center_freq = self.center_freq
+        sdr.gain = self.gain
+
+        block_size = 131072
+        start_time = time.time()
+
+        print("RadioRecorder: Recording started")
+
+        try:
+            while not self.stop_flag and (time.time() - start_time) < 90:
+                block = sdr.read_samples(block_size)
+                a_block = accumulate_block(block, self.sample_rate)
+                if a_block.size:
+                    self.a_vals.append(a_block)
+
+        finally:
+            try:
+                sdr.close()
+            except Exception:
+                pass
+
+        if not self.a_vals:
+            print("RadioRecorder: No data captured")
+            self.recording = False
+            return
+
+        a_val = np.concatenate(self.a_vals)
+        threshold = np.mean(a_val)
+        s_d = getBinary(a_val, threshold)
+        bit_sequence = s_d.tolist()
+
+        print(f"RadioRecorder: Captured {len(bit_sequence)} bits")
+
+        # ===================== SAVE (SAFE SIZE) =====================
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        outdir = "/home/astrobotic/nasa-dcgr-astrobotic-rover/data"
+        os.makedirs(outdir, exist_ok=True)
+
+        outpath = f"{outdir}/sdr_record_{ts}.npz"
+        np.savez_compressed(
+            outpath,
+            a_val=a_val,
+            s_d=s_d,
+            bit_sequence=np.array(bit_sequence),
+            fs=self.sample_rate,
+            center_freq=self.center_freq,
+            gain=self.gain
+        )
+
+        print(f"Saved SDR data to {outpath}")
+
+        # ===================== Decode temperature =====================
+        barker7 = [1,0,1,1,0,1,0]
+        temps_f = []
+        timestamps = []
+
+        for i in range(len(bit_sequence)-20):
+            if bit_sequence[i:i+7] == barker7:
+                payload = bit_sequence[i+7:i+20]
+                raw = int("".join(map(str,payload)), 2)
+                temp_f = (raw * 0.0625 * 9/5) + 32
+                temps_f.append(temp_f)
+                timestamps.append(datetime.now().isoformat())
+
+        if temps_f:
+            tpath = f"{outdir}/temps_{ts}.npz"
+            np.savez_compressed(tpath,
+                                temperatures_f=temps_f,
+                                timestamps=timestamps)
+            print(f"Saved decoded temperatures to {tpath}")
+        else:
+            print("No valid temperature packets detected")
+
+        self.recording = False
+        print("RadioRecorder: Recording stopped")
+
+    def start(self):
+        if self.recording:
+            return
+        self.stop_flag = False
+        self.a_vals.clear()
+        self.bits.clear()
+        self.recording = True
+        self.thread = threading.Thread(target=self._record_loop)
+        self.thread.start()
+
+    def stop(self):
+        self.stop_flag = True
+        if self.thread:
+            self.thread.join()
+
+    def close(self):
+        pass
+
+
+radio_recorder = RadioRecorder()
+
+# ===================== Controller =====================
+class BaseController(Controller):
+    def on_square_press(self):
+        print("Square → start SDR")
+        radio_recorder.start()
+
+    def on_circle_press(self):
+        print("Circle → stop SDR")
+        radio_recorder.stop()
+
+    def on_x_press(self):
+        print("X → emergency stop")
+        rc.SpeedM1(address1, 0)
+        rc.SpeedM2(address1, 0)
+        rc.SpeedM1(address2, 0)
+        rc.SpeedM2(address2, 0)
+        radio_recorder.stop()
+        os._exit(0)
+
+
+class JoystickController(BaseController):
+    def __init__(self, maxSpeed, deadZone, **kwargs):
+        super().__init__(**kwargs)
+        self.maxSpeed = maxSpeed
+        self.deadZone = deadZone
+
+    def mapSpeed(self, value):
+        if abs(value) < self.deadZone:
+            return 0
+        return int((abs(value) / 32767.0) * self.maxSpeed)
+
+    def on_L3_up(self, value):
+        s = self.mapSpeed(value)
+        rc.SpeedM1(address1, -s)
+        rc.SpeedM2(address2, -s)
+
+    def on_L3_down(self, value):
+        s = self.mapSpeed(value)
+        rc.SpeedM1(address1, s)
+        rc.SpeedM2(address2, s)
+
+    def on_R3_up(self, value):
+        s = self.mapSpeed(value)
+        rc.SpeedM2(address1, s)
+        rc.SpeedM1(address2, s)
+
+    def on_R3_down(self, value):
+        s = self.mapSpeed(value)
+        rc.SpeedM2(address1, -s)
+        rc.SpeedM1(address2, -s)
+
+
+def main():
+    while not os.path.exists("/dev/input/js0"):
+        time.sleep(1)
+
+    controller = JoystickController(
+        maxSpeed=12000,
+        deadZone=2000,
+        interface="/dev/input/js0",
+        connecting_using_ds4drv=False
+    )
+
+    print("Controller ready")
+    controller.listen()
+
+
+if __name__ == "__main__":
+    main()
